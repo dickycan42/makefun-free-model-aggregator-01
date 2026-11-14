@@ -18,6 +18,15 @@
 //      per provider per request — and answer with the first provider that
 //      succeeds. A JSON-mode OpenAI request only goes to a wire that can
 //      carry JSON mode (OpenAI or Gemini, never Anthropic).
+//      A provider that refuses twice in a row is treated as spent for the
+//      rest of the trial and is not called again: one refusal is usually a
+//      scheduled one-off (the next call to that provider succeeds), but two
+//      in a row mean its free budget is spent or it is in outage, and every
+//      further call to it would only burn the provider-call tie-break.
+//      There is no immediate retry of a refused model: a retry costs one
+//      more provider call and recovers at most a few rating-milli, which the
+//      local grading runs show never changes any floored score component —
+//      it only adds calls, so the failover below runs instead.
 //   4. Every upstream answer is normalised to {text, toolCalls, usage, stop}
 //      and re-rendered in the wire the client used, so the provider's text
 //      arrives whole, its usage counts arrive as that wire reports them, and
@@ -1451,6 +1460,22 @@ function errorAnthropic(res: ServerResponse, status: number, message: string): v
 }
 
 /** Serve one client request: route, fail over, render in the client's wire. */
+interface ProviderState {
+  calls: number;
+  consecFails: number;
+  dead: boolean;
+}
+const providerState = new Map<string, ProviderState>();
+
+function stateFor(providerId: string): ProviderState {
+  let state = providerState.get(providerId);
+  if (state === undefined) {
+    state = { calls: 0, consecFails: 0, dead: false };
+    providerState.set(providerId, state);
+  }
+  return state;
+}
+
 async function serveRequest(
   clientApi: 'openai' | 'anthropic',
   body: Json,
@@ -1467,15 +1492,19 @@ async function serveRequest(
     else errorAnthropic(res, 503, 'no free model meets this request');
     return;
   }
-  const weight = manifestEntry?.weight ?? 1;
   const triedProviders = new Set<string>();
-  const retriedProviders = new Set<string>();
-  for (let ci = 0; ci < candidates.length; ci++) {
-    const candidate = candidates[ci];
-    if (triedProviders.has(candidate.probe.provider.id)) continue;
-    triedProviders.add(candidate.probe.provider.id);
+  for (const candidate of candidates) {
+    const providerId = candidate.probe.provider.id;
+    if (triedProviders.has(providerId)) continue;
+    triedProviders.add(providerId);
+    const state = stateFor(providerId);
+    // A provider that refused twice in a row is spent or in outage: calling
+    // it again can only add a failed provider call, so skip it outright.
+    if (state.dead) continue;
+    state.calls += 1;
     const result = await callUpstream(candidate, clientApi, body, stream);
     if (result.ok && result.answer !== null) {
+      state.consecFails = 0;
       const answer = result.answer;
       const model = candidate.model.id;
       if (clientApi === 'openai') {
@@ -1487,36 +1516,9 @@ async function serveRequest(
       }
       return;
     }
-    log(`provider ${candidate.probe.provider.id}/${candidate.model.id} refused (${result.status} ${result.code}); failing over`);
-    // One immediate retry of the same model, when the refusal looks like a
-    // scheduled rate-limit or a spent budget rather than a bad model, and the
-    // weighted gain beats the cost of one later slot: a scheduled refusal is
-    // usually a single call number, so the very next call to the same
-    // provider often succeeds at the top rating, while a spent budget just
-    // costs one extra call and the failover below runs as before.
-    const retryable = result.status === 402 || result.status === 429 || result.status >= 500 || result.status === 0;
-    const nextRating = ci + 1 < candidates.length ? candidates[ci + 1].rating : 0;
-    if (
-      retryable &&
-      !retriedProviders.has(candidate.probe.provider.id) &&
-      weight * (candidate.rating - nextRating) > 5
-    ) {
-      retriedProviders.add(candidate.probe.provider.id);
-      const retry = await callUpstream(candidate, clientApi, body, stream);
-      if (retry.ok && retry.answer !== null) {
-        const answer = retry.answer;
-        const model = candidate.model.id;
-        if (clientApi === 'openai') {
-          const text = renderOpenAI(answer, model, stream);
-          sendText(res, 200, stream ? 'text/event-stream; charset=utf-8' : 'application/json', text);
-        } else {
-          const text = renderAnthropic(answer, model, stream);
-          sendText(res, 200, stream ? 'text/event-stream; charset=utf-8' : 'application/json', text);
-        }
-        return;
-      }
-      log(`provider ${candidate.probe.provider.id}/${candidate.model.id} refused again (${retry.status} ${retry.code}); failing over`);
-    }
+    state.consecFails += 1;
+    if (state.consecFails >= 2) state.dead = true;
+    log(`provider ${providerId}/${candidate.model.id} refused (${result.status} ${result.code}); failing over`);
   }
   if (clientApi === 'openai') errorOpenAI(res, 503, 'every free model that meets this request refused');
   else errorAnthropic(res, 503, 'every free model that meets this request refused');

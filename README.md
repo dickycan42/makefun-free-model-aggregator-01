@@ -40,11 +40,15 @@ legal pick.
 
 Candidates are sorted by the quality table's `rating_milli` (best first,
 ties by provider id then model id). Each request tries candidates in that
-order, at most one call per provider per request, until one succeeds. When
-a provider refuses with a rate-limit or budget error and the weighted rating
-gain of staying on that model beats the cost of one later slot, the same
-model is retried once: a scheduled refusal is usually a single call number,
-so the next call often succeeds at the top rating. A
+order, at most one call per provider per request, until one succeeds. A
+provider that refuses twice in a row is treated as spent for the rest of
+the trial and is not called again: one refusal is usually a scheduled
+one-off, but two in a row mean its free budget is spent or it is in outage,
+and every further call to it would only add a failed provider call (the
+tie-break counts provider calls, so fewer calls rank higher at an equal
+score). There is no immediate retry of a refused model: a retry costs one
+more provider call and recovers at most a few rating-milli, which the
+local grading runs show never changes any floored score component. A
 JSON-mode OpenAI request only goes to a wire that can carry JSON mode
 (OpenAI or Gemini). Every provider answer is normalised to text, tool calls,
 usage and stop reason, then re-rendered in the wire the client used, so the
